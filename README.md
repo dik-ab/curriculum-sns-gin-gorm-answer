@@ -12,6 +12,7 @@ React frontend:
 ```bash
 VITE_API_URL="http://localhost:8000"
 VITE_SOCKET_URL="http://localhost:8000"
+VITE_REALTIME_DRIVER="websocket"
 ```
 
 The default database is SQLite at `./sns_gin_gorm.db` for local verification. Set `DATABASE_URL=postgres://...` to use PostgreSQL.
