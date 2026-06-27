@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -9,10 +10,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
 	"github.com/zishang520/engine.io/v2/types"
 	socketio "github.com/zishang520/socket.io/v2/socket"
 	"golang.org/x/crypto/bcrypt"
@@ -31,9 +34,11 @@ type Config struct {
 }
 
 type App struct {
-	cfg Config
-	db  *gorm.DB
-	io  *socketio.Server
+	cfg     Config
+	db      *gorm.DB
+	io      *socketio.Server
+	wsMu    sync.Mutex
+	wsRooms map[uint]map[*websocket.Conn]bool
 }
 
 type User struct {
@@ -157,7 +162,7 @@ func newApp(cfg Config) (*App, error) {
 	if err := db.AutoMigrate(&User{}, &EmailVerificationToken{}, &Post{}, &Like{}, &Follow{}, &Conversation{}, &Message{}); err != nil {
 		return nil, err
 	}
-	app := &App{cfg: cfg, db: db}
+	app := &App{cfg: cfg, db: db, wsRooms: map[uint]map[*websocket.Conn]bool{}}
 	app.io = app.socketServer()
 	return app, nil
 }
@@ -200,6 +205,7 @@ func (a *App) router() *gin.Engine {
 	r.POST("/conversations", a.requireUser, a.createConversation)
 	r.GET("/conversations/:id/messages", a.requireUser, a.messages)
 	r.POST("/conversations/:id/messages", a.requireUser, a.createMessageHTTP)
+	r.GET("/chat", a.websocketChat)
 	r.GET("/socket.io/*any", gin.WrapH(a.io.ServeHandler(socketOptions(a.cfg.FrontendURL))))
 	r.POST("/socket.io/*any", gin.WrapH(a.io.ServeHandler(socketOptions(a.cfg.FrontendURL))))
 	return r
@@ -589,6 +595,93 @@ func (a *App) socketServer() *socketio.Server {
 		})
 	})
 	return io
+}
+
+type websocketPacket struct {
+	Type           string `json:"type"`
+	ConversationID uint   `json:"conversationId"`
+	Content        string `json:"content"`
+}
+
+func (a *App) websocketChat(c *gin.Context) {
+	user, err := a.userFromRequest(c.Request)
+	if err != nil {
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return r.Header.Get("Origin") == a.cfg.FrontendURL
+		},
+	}
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	joined := map[uint]bool{}
+	defer func() {
+		a.wsMu.Lock()
+		defer a.wsMu.Unlock()
+		for conversationID := range joined {
+			delete(a.wsRooms[conversationID], conn)
+			if len(a.wsRooms[conversationID]) == 0 {
+				delete(a.wsRooms, conversationID)
+			}
+		}
+	}()
+
+	for {
+		var packet websocketPacket
+		if err := conn.ReadJSON(&packet); err != nil {
+			return
+		}
+		switch packet.Type {
+		case "joinConversation":
+			if packet.ConversationID == 0 || !a.isConversationParticipant(packet.ConversationID, user.ID) {
+				continue
+			}
+			a.wsMu.Lock()
+			if a.wsRooms[packet.ConversationID] == nil {
+				a.wsRooms[packet.ConversationID] = map[*websocket.Conn]bool{}
+			}
+			a.wsRooms[packet.ConversationID][conn] = true
+			a.wsMu.Unlock()
+			joined[packet.ConversationID] = true
+		case "sendMessage":
+			if packet.ConversationID == 0 || !a.isConversationParticipant(packet.ConversationID, user.ID) {
+				continue
+			}
+			message, ok := a.createMessage(packet.ConversationID, user.ID, packet.Content)
+			if !ok {
+				continue
+			}
+			a.broadcastWebsocketMessage(packet.ConversationID, messageResponse(message))
+		}
+	}
+}
+
+func (a *App) broadcastWebsocketMessage(conversationID uint, message gin.H) {
+	payload, err := json.Marshal(gin.H{"type": "newMessage", "message": message})
+	if err != nil {
+		return
+	}
+	a.wsMu.Lock()
+	connections := make([]*websocket.Conn, 0, len(a.wsRooms[conversationID]))
+	for conn := range a.wsRooms[conversationID] {
+		connections = append(connections, conn)
+	}
+	a.wsMu.Unlock()
+
+	for _, conn := range connections {
+		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+			a.wsMu.Lock()
+			delete(a.wsRooms[conversationID], conn)
+			a.wsMu.Unlock()
+			_ = conn.Close()
+		}
+	}
 }
 
 func (a *App) createMessage(conversationID, senderID uint, content string) (Message, bool) {
