@@ -1,0 +1,8 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+coverage.out
+tmp/
+dist/
+curriculum-sns-gin-gorm-answer
